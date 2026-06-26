@@ -1,0 +1,64 @@
+# Domains the sandbox is allowed to reach. One per line.
+# Lines starting with # and blank lines are ignored.
+# After editing, refresh from inside the container:
+#     sudo /usr/local/bin/init-firewall.sh
+
+# --- Anthropic / Claude Code ---
+api.anthropic.com
+console.anthropic.com
+claude.ai
+
+# --- Package registries ---
+registry.npmjs.org
+registry.yarnpkg.com
+pypi.org
+files.pythonhosted.org
+pythonhosted.org
+
+# --- Asset CDNs (needed for Chromium-MCP screenshots of real sites) ---
+cdn.jsdelivr.net
+cdnjs.cloudflare.com
+unpkg.com
+fonts.googleapis.com
+fonts.gstatic.com
+
+# --- GitHub ---
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+gist.githubusercontent.com
+avatars.githubusercontent.com
+uploads.github.com
+
+# --- Language / framework docs ---
+developer.mozilla.org
+docs.python.org
+nodejs.org
+nodejs.dev
+react.dev
+pkg.go.dev
+crates.io
+docs.rs
+docs.oracle.com
+spring.io
+docs.spring.io
+
+# --- Knowledge sites ---
+stackoverflow.com
+stackexchange.com
+meta.stackoverflow.com
+meta.stackexchange.com
+serverfault.com
+superuser.com
+askubuntu.com
+vladmihalcea.com
+medium.com
+victorrentea.ro
+
+# --- MCP servers (Context7 live docs) ---
+mcp.context7.com
+context7.com
+
+# Add more as needed, then re-run sudo init-firewall.sh

@@ -1,0 +1,5 @@
+# IDE / editor
+.idea/
+
+# Tooling state
+.serena/

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Host-side launcher for the Claude Code Docker sandbox.
+#
+# Usage:
+#   claude-docker                 # start claude in $PWD (must be under ~/workspace)
+#   claude-docker shell           # drop into a bash inside the sandbox
+#   claude-docker refresh         # re-apply firewall (one-shot)
+#   claude-docker <claude-args>   # passed straight to `claude`
+set -euo pipefail
+
+IMAGE="${CLAUDE_DOCKER_IMAGE:-claude-docker:latest}"
+WORKSPACE_ROOT="${CLAUDE_DOCKER_WORKSPACE:-$HOME/workspace}"
+HOME_DIR="${CLAUDE_DOCKER_HOME:-$HOME/.claude-docker/home}"
+CLAUDE_JSON="${CLAUDE_DOCKER_CLAUDE_JSON:-$HOME/.claude-docker/claude.json}"
+ALLOWLIST_FILE="${CLAUDE_DOCKER_ALLOWLIST:-$HOME/workspace/claude-docker/allowlist.txt}"
+
+mkdir -p "$HOME_DIR" "$(dirname "$CLAUDE_JSON")"
+# Seed the file so Docker bind-mounts it as a file (not a dir).
+if [ ! -f "$CLAUDE_JSON" ]; then
+    echo '{}' > "$CLAUDE_JSON"
+fi
+
+cwd="$(pwd -P)"
+case "$cwd" in
+    "$WORKSPACE_ROOT"|"$WORKSPACE_ROOT"/*)
+        rel="${cwd#$WORKSPACE_ROOT}"
+        container_cwd="/workspace${rel}"
+        ;;
+    *)
+        echo "[claude-docker] WARN: cwd ($cwd) is outside $WORKSPACE_ROOT; starting at /workspace" >&2
+        container_cwd="/workspace"
+        ;;
+esac
+
+docker_args=(
+    --rm -it
+    --cap-add=NET_ADMIN --cap-add=NET_RAW
+    -v "$WORKSPACE_ROOT:/workspace"
+    -v "$HOME_DIR:/home/dev/.claude"
+    -v "$CLAUDE_JSON:/home/dev/.claude.json"
+    -w "$container_cwd"
+    -e TERM
+)
+
+if [ -f "$ALLOWLIST_FILE" ]; then
+    docker_args+=( -v "$ALLOWLIST_FILE:/etc/claude-docker/allowlist.txt:ro" )
+fi
+
+# Hot-mount the firewall script so edits on the host take effect on next run.
+FIREWALL_SCRIPT="${CLAUDE_DOCKER_FIREWALL:-$HOME/workspace/claude-docker/init-firewall.sh}"
+if [ -f "$FIREWALL_SCRIPT" ]; then
+    docker_args+=( -v "$FIREWALL_SCRIPT:/usr/local/bin/init-firewall.sh:ro" )
+fi
+
+# Forward common env vars if set, without leaking unset ones.
+for v in ANTHROPIC_API_KEY GITHUB_TOKEN GH_TOKEN; do
+    if [ -n "${!v:-}" ]; then
+        docker_args+=( -e "$v" )
+    fi
+done
+
+print_banner() {
+    local sep='══════════════════════════════════════════════════════════════════════'
+    local n=0 domains="" first=""
+    if [ -f "$ALLOWLIST_FILE" ]; then
+        domains=$(grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE")
+        n=$(printf '%s\n' "$domains" | wc -l | tr -d ' ')
+        first=$(printf '%s\n' "$domains" | head -6 | paste -sd '  ' -)
+    fi
+    local remaining=$((n - 6))
+    printf '\n%s\n' "$sep"
+    printf ' claude-docker · containerized sandbox\n'
+    printf '%s\n' "$sep"
+    printf ' workspace bind    %s  →  /workspace\n' "$WORKSPACE_ROOT"
+    printf ' state persisted   %s\n' "$(dirname "$HOME_DIR")"
+    printf ' egress ALLOW (%d domains, TCP 80/443/22 only):\n' "$n"
+    if [ -f "$ALLOWLIST_FILE" ]; then
+        awk -v width=100 -v indent="     " '
+            BEGIN { line = indent }
+            function flush() { if (length(line) > length(indent)) { print line; line = indent } }
+            /^# --- / {
+                flush()
+                section = $0
+                sub(/^# --- */, "", section)
+                sub(/ *---.*$/, "", section)
+                print "   " section
+                line = indent
+                next
+            }
+            /^[[:space:]]*(#|$)/ { next }
+            {
+                sep = (line == indent ? "" : ", ")
+                if (length(line) + length(sep) + length($0) > width) {
+                    print line ","
+                    line = indent $0
+                } else {
+                    line = line sep $0
+                }
+            }
+            END { flush() }
+        ' "$ALLOWLIST_FILE"
+    fi
+    printf ' egress DENY       everything else (default-deny, fast TCP-reset)\n'
+    printf ' fs DENY           everything outside %s and persisted home\n' "$WORKSPACE_ROOT"
+    printf '%s\n\n' "$sep"
+}
+print_banner
+
+exec docker run "${docker_args[@]}" "$IMAGE" "$@"
