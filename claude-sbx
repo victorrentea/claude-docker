@@ -19,8 +19,8 @@
 # Env overrides:
 #   CLAUDE_SBX_WORKSPACE   host dir to mount            (default: $PWD)
 #   CLAUDE_SBX_NAME        sandbox name                 (default: claude-<dir>)
-#   CLAUDE_SBX_ALLOWLIST   egress allowlist file        (default: the shared
-#                          claude-docker/allowlist.txt next to this script)
+#   CLAUDE_SBX_ALLOWLIST   egress allowlist file        (default: the allowlist.txt
+#                          shared with claude-docker: ~/workspace/claude-docker/allowlist.txt)
 #   CLAUDE_SBX_TEMPLATE    container template image     (passed to -t / --template)
 #   CLAUDE_SBX_NO_PROXY=1  skip the egress allowlist (allow all outbound)
 set -euo pipefail
@@ -30,10 +30,9 @@ command -v docker >/dev/null 2>&1 \
 docker sandbox version >/dev/null 2>&1 \
     || { echo "[claude-sbx] 'docker sandbox' unavailable — update Docker Desktop" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
-
 WORKSPACE="${CLAUDE_SBX_WORKSPACE:-$(pwd -P)}"
-ALLOWLIST_FILE="${CLAUDE_SBX_ALLOWLIST:-$SCRIPT_DIR/allowlist.txt}"
+# Shared with claude-docker so both launchers enforce the same egress policy.
+ALLOWLIST_FILE="${CLAUDE_SBX_ALLOWLIST:-$HOME/workspace/claude-docker/allowlist.txt}"
 
 # Deterministic sandbox name from the workspace basename, sanitized to the
 # charset docker sandbox accepts (letters, digits, . _ + -).
@@ -50,19 +49,20 @@ sandbox_exists() { docker sandbox ls 2>/dev/null | grep -Fq -- "$NAME"; }
 apply_proxy() {
     [ "${CLAUDE_SBX_NO_PROXY:-0}" = "1" ] && return 0
     [ -f "$ALLOWLIST_FILE" ] || { echo "[claude-sbx] no allowlist ($ALLOWLIST_FILE) — leaving egress unrestricted" >&2; return 0; }
-    local args=() d
+    local args=() d n=0
     while IFS= read -r d; do
-        [ -n "$d" ] && args+=( --allow-host "$d" )
+        [ -n "$d" ] && { args+=( --allow-host "$d" ); n=$((n + 1)); }
     done < <(grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE")
-    [ ${#args[@]} -eq 0 ] && return 0
-    echo "[claude-sbx] applying egress allowlist (${#args[@]} hosts, default-deny)…" >&2
+    [ "$n" -eq 0 ] && return 0
+    echo "[claude-sbx] applying egress allowlist ($n hosts, default-deny)..." >&2
     docker sandbox network proxy "$NAME" --policy deny "${args[@]}" >/dev/null
 }
 
 ensure_sandbox() {
     if ! sandbox_exists; then
-        echo "[claude-sbx] creating sandbox '$NAME' for $WORKSPACE…" >&2
-        docker sandbox create claude "$WORKSPACE" --name "$NAME" "${TEMPLATE_ARGS[@]}" >/dev/null
+        echo "[claude-sbx] creating sandbox '$NAME' for $WORKSPACE..." >&2
+        # --name / --template are flags of `create` itself, so they precede the `claude` subcommand.
+        docker sandbox create --name "$NAME" ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"} claude "$WORKSPACE" >/dev/null
     fi
     apply_proxy
 }
@@ -114,6 +114,10 @@ case "$cmd" in
     *)
         print_banner
         ensure_sandbox
-        exec docker sandbox run "$NAME" -- "$@"
+        if [ "$#" -gt 0 ]; then
+            exec docker sandbox run "$NAME" -- "$@"
+        else
+            exec docker sandbox run "$NAME"
+        fi
         ;;
 esac
