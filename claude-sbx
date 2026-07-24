@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Host-side launcher for Claude Code inside a Docker Sandbox (`docker sandbox`).
+#
+# A lighter sibling of `claude-docker`: instead of a hand-built image plus an
+# iptables firewall, this delegates to Docker's official agent-sandbox feature
+# (`docker sbx` / `docker sandbox`), which manages the microVM, the workspace
+# bind-mount, and a MITM egress proxy for us. Same spirit, far less machinery.
+#
+# Usage:
+#   claude-sbx                    # run claude in the current directory
+#   claude-sbx <claude-args...>   # forwarded to claude (e.g. --continue, -p ...)
+#   claude-sbx shell              # open a shell inside the sandbox
+#   claude-sbx net                # (re)apply the egress allowlist proxy
+#   claude-sbx logs               # show sandbox network logs
+#   claude-sbx stop               # stop the sandbox (state is kept)
+#   claude-sbx rm                 # remove the sandbox and its resources
+#   claude-sbx ls                 # list sandboxes
+#
+# Env overrides:
+#   CLAUDE_SBX_WORKSPACE   host dir to mount            (default: $PWD)
+#   CLAUDE_SBX_NAME        sandbox name                 (default: claude-<dir>)
+#   CLAUDE_SBX_ALLOWLIST   egress allowlist file        (default: the shared
+#                          claude-docker/allowlist.txt next to this script)
+#   CLAUDE_SBX_TEMPLATE    container template image     (passed to -t / --template)
+#   CLAUDE_SBX_NO_PROXY=1  skip the egress allowlist (allow all outbound)
+set -euo pipefail
+
+command -v docker >/dev/null 2>&1 \
+    || { echo "[claude-sbx] docker not found on PATH" >&2; exit 1; }
+docker sandbox version >/dev/null 2>&1 \
+    || { echo "[claude-sbx] 'docker sandbox' unavailable — update Docker Desktop" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+
+WORKSPACE="${CLAUDE_SBX_WORKSPACE:-$(pwd -P)}"
+ALLOWLIST_FILE="${CLAUDE_SBX_ALLOWLIST:-$SCRIPT_DIR/allowlist.txt}"
+
+# Deterministic sandbox name from the workspace basename, sanitized to the
+# charset docker sandbox accepts (letters, digits, . _ + -).
+default_name="claude-$(basename "$WORKSPACE")"
+default_name="$(printf '%s' "$default_name" | tr -c 'A-Za-z0-9._+-' '-')"
+NAME="${CLAUDE_SBX_NAME:-$default_name}"
+
+TEMPLATE_ARGS=()
+[ -n "${CLAUDE_SBX_TEMPLATE:-}" ] && TEMPLATE_ARGS=( -t "$CLAUDE_SBX_TEMPLATE" )
+
+sandbox_exists() { docker sandbox ls 2>/dev/null | grep -Fq -- "$NAME"; }
+
+# Build the deny-by-default egress proxy from the shared allowlist.
+apply_proxy() {
+    [ "${CLAUDE_SBX_NO_PROXY:-0}" = "1" ] && return 0
+    [ -f "$ALLOWLIST_FILE" ] || { echo "[claude-sbx] no allowlist ($ALLOWLIST_FILE) — leaving egress unrestricted" >&2; return 0; }
+    local args=() d
+    while IFS= read -r d; do
+        [ -n "$d" ] && args+=( --allow-host "$d" )
+    done < <(grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE")
+    [ ${#args[@]} -eq 0 ] && return 0
+    echo "[claude-sbx] applying egress allowlist (${#args[@]} hosts, default-deny)…" >&2
+    docker sandbox network proxy "$NAME" --policy deny "${args[@]}" >/dev/null
+}
+
+ensure_sandbox() {
+    if ! sandbox_exists; then
+        echo "[claude-sbx] creating sandbox '$NAME' for $WORKSPACE…" >&2
+        docker sandbox create claude "$WORKSPACE" --name "$NAME" "${TEMPLATE_ARGS[@]}" >/dev/null
+    fi
+    apply_proxy
+}
+
+print_banner() {
+    local sep='══════════════════════════════════════════════════════════════════════'
+    local n=0
+    if [ "${CLAUDE_SBX_NO_PROXY:-0}" != "1" ] && [ -f "$ALLOWLIST_FILE" ]; then
+        n=$(grep -vcE '^\s*(#|$)' "$ALLOWLIST_FILE")
+    fi
+    printf '\n%s\n' "$sep"
+    printf ' claude-sbx · Docker Sandbox (docker sbx)\n'
+    printf '%s\n' "$sep"
+    printf ' sandbox        %s\n' "$NAME"
+    printf ' workspace      %s  (mounted at same path)\n' "$WORKSPACE"
+    if [ "${CLAUDE_SBX_NO_PROXY:-0}" = "1" ]; then
+        printf ' egress         UNRESTRICTED (CLAUDE_SBX_NO_PROXY=1)\n'
+    elif [ "$n" -gt 0 ]; then
+        printf ' egress ALLOW   %d hosts from %s (default-deny)\n' "$n" "$ALLOWLIST_FILE"
+    else
+        printf ' egress         unrestricted (no allowlist found)\n'
+    fi
+    printf '%s\n\n' "$sep"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    shell)
+        ensure_sandbox
+        docker sandbox exec -it "$NAME" bash 2>/dev/null \
+            || docker sandbox exec -it "$NAME" sh
+        ;;
+    net|refresh)
+        ensure_sandbox
+        echo "[claude-sbx] egress allowlist applied to '$NAME'." >&2
+        ;;
+    logs)
+        docker sandbox network log
+        ;;
+    stop)
+        docker sandbox stop "$NAME"
+        ;;
+    rm|remove)
+        docker sandbox rm "$NAME"
+        ;;
+    ls|list)
+        docker sandbox ls
+        ;;
+    *)
+        print_banner
+        ensure_sandbox
+        exec docker sandbox run "$NAME" -- "$@"
+        ;;
+esac
