@@ -6,18 +6,29 @@
 # (`docker sbx` / `docker sandbox`), which manages the microVM, the workspace
 # bind-mount, and a MITM egress proxy for us. Same spirit, far less machinery.
 #
-# ⚠️  BILLING LIMITATION — NO CLAUDE SUBSCRIPTION SUPPORT
-#   Docker Sandbox force-routes ALL Anthropic traffic through its own
-#   "proxy-managed" billing proxy (see `apiKeyHelper: "echo proxy-managed"` in
-#   the template's ~/.claude/settings.json). That proxy strips the request's
-#   Authorization header, so a personal Claude Pro/Max subscription (OAuth)
-#   CANNOT be used here — every inference returns "credit balance is too low".
-#   `docker sandbox network proxy --bypass-host api.anthropic.com` does NOT
-#   override it (verified 2026-07). This launcher therefore only works with
-#   Docker-managed billing or your own ANTHROPIC_API_KEY (pay-as-you-go API,
-#   not the subscription).
-#   → For sandboxed SUBSCRIPTION use, use `claude-docker` instead: it has no
-#     billing proxy and talks straight to Anthropic with your OAuth login.
+# AUTH — Docker brokers Anthropic credentials via a HOST-SIDE proxy
+#   Docker Sandbox routes Anthropic traffic through a proxy on the host. The
+#   agent inside sends the sentinel `proxy-managed` (see `apiKeyHelper` in the
+#   template's ~/.claude/settings.json); for the configured hosts —
+#   api.anthropic.com, console.anthropic.com, claude.ai, mcp-proxy.anthropic.com
+#   — the proxy swaps that sentinel for a REAL credential REGISTERED ON THE HOST.
+#   The real secret never enters the sandbox.
+#
+#   ⇒ Register a host-side credential once, or every request comes back
+#     "credit balance is too low":
+#       • Subscription (Pro/Max): run  /login  inside Claude Code once — the
+#         OAuth flow runs on the host and the proxy brokers it thereafter.
+#       • API key: install the standalone `sbx` CLI and run
+#         `sbx secret set -g anthropic`  (docs.docker.com/ai/sandboxes).
+#
+#   Do NOT hand-set keys/tokens INSIDE the sandbox (the docs warn against it):
+#   the proxy overrides auth for the configured hosts, so an unregistered
+#   credential still fails. For the same reason keep those hosts on --allow-host
+#   (MITM on) — a --bypass-host would stop the proxy from injecting the secret.
+#   NOTE: this launcher drives the `docker sandbox` plugin (v0.12.x), which has
+#   NO `secret` subcommand; for `sbx secret …` install the standalone CLI:
+#   `brew install docker/tap/sbx`. (`claude-docker` remains a proxy-free
+#   alternative that logs in straight to Anthropic.)
 #
 # Usage:
 #   claude-sbx                    # run claude in the current directory
@@ -98,8 +109,8 @@ print_banner() {
     else
         printf ' egress         unrestricted (no allowlist found)\n'
     fi
-    printf ' billing        Docker-managed proxy — NOT your Claude subscription\n'
-    printf '                (subscription? use claude-docker instead)\n'
+    printf ' auth           proxy-brokered on host; first time run  /login  in Claude Code\n'
+    printf '                (for your subscription; do NOT set keys inside the sandbox)\n'
     printf '%s\n\n' "$sep"
 }
 
