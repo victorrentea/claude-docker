@@ -31,6 +31,7 @@
 #   claude-sbx                    # run claude in the current directory
 #   claude-sbx <claude-args...>   # forwarded to claude (e.g. --continue, -p ...)
 #   claude-sbx shell              # open a shell inside the sandbox
+#   claude-sbx statusline         # (re)install the host statusline into the sandbox
 #   claude-sbx policy             # show the global network policy
 #   claude-sbx logs               # show this sandbox's allow/block log
 #   claude-sbx stop               # stop the sandbox (state is kept)
@@ -43,6 +44,9 @@
 #   CLAUDE_SBX_POLICY      global net policy if unset     (default: balanced)
 #   CLAUDE_SBX_ALLOWLIST   hosts to allow under deny-all  (default: shared allowlist.txt)
 #   CLAUDE_SBX_TEMPLATE    container template image       (passed to -t)
+#   CLAUDE_SBX_STATUSLINE  host statusline script to mirror inside the sandbox
+#                          (default: the .statusLine.command from ~/.claude/settings.json)
+#   CLAUDE_SBX_NO_STATUSLINE=1   don't install the statusline into the sandbox
 set -euo pipefail
 
 command -v sbx >/dev/null 2>&1 \
@@ -59,6 +63,15 @@ NAME="${CLAUDE_SBX_NAME:-$default_name}"
 
 TEMPLATE_ARGS=()
 [ -n "${CLAUDE_SBX_TEMPLATE:-}" ] && TEMPLATE_ARGS=( -t "$CLAUDE_SBX_TEMPLATE" )
+
+# Host statusline script to mirror inside the sandbox. Resolve from the user's
+# settings.json (.statusLine.command); fall back to the conventional path.
+STATUSLINE_SRC="${CLAUDE_SBX_STATUSLINE:-}"
+if [ -z "$STATUSLINE_SRC" ]; then
+    STATUSLINE_SRC="$(jq -r '.statusLine.command // empty' "$HOME/.claude/settings.json" 2>/dev/null || true)"
+    [ -n "$STATUSLINE_SRC" ] || STATUSLINE_SRC="$HOME/.claude/statusline-command.sh"
+fi
+SBX_STATUSLINE_DEST="/home/agent/.claude/statusline-command.sh"
 
 require_login() {
     # `sbx ls` exits non-zero when not signed in to Docker.
@@ -96,6 +109,33 @@ ensure_sandbox() {
     fi
 }
 
+# Mirror the host statusline into the sandbox, ported from macOS/BSD to the
+# sandbox's Linux (uutils/GNU) date+stat, and prefixed with a magenta "sbx"
+# badge so you always know you're inside a sandbox. Idempotent; runs each launch
+# so host edits propagate. The three sed rules track these host lines:
+#   date -r "$reset"                              -> date -d @"$reset"
+#   stat -f %m                                    -> stat -c %Y
+#   date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts_clean" -> date -u -d "$ts_clean"
+configure_statusline() {
+    [ "${CLAUDE_SBX_NO_STATUSLINE:-0}" = "1" ] && return 0
+    [ -f "$STATUSLINE_SRC" ] || return 0
+    if ! sed \
+            -e 's|date -r "$reset"|date -d @"$reset"|g' \
+            -e 's|stat -f %m|stat -c %Y|g' \
+            -e 's|date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts_clean"|date -u -d "$ts_clean"|g' \
+            -e 's|^echo "$out"$|echo "${ESC}[1;35msbx${RESET} $out"|' \
+            "$STATUSLINE_SRC" \
+        | sbx exec -i "$NAME" sh -c "umask 022; mkdir -p /home/agent/.claude; cat > '$SBX_STATUSLINE_DEST'; chmod +x '$SBX_STATUSLINE_DEST'" >/dev/null 2>&1
+    then
+        echo "[claude-sbx] note: could not install statusline into '$NAME'" >&2
+        return 0
+    fi
+    # Point settings.json at it, preserving every existing key (e.g. proxy auth).
+    sbx exec "$NAME" sh -c \
+        "jq '.statusLine={type:\"command\",command:\"$SBX_STATUSLINE_DEST\",refreshInterval:1}' /home/agent/.claude/settings.json > /home/agent/.claude/settings.json.tmp && mv /home/agent/.claude/settings.json.tmp /home/agent/.claude/settings.json" \
+        >/dev/null 2>&1 || true
+}
+
 print_banner() {
     local sep='══════════════════════════════════════════════════════════════════════'
     printf '\n%s\n' "$sep"
@@ -130,11 +170,19 @@ case "$cmd" in
     ls|list)
         sbx ls
         ;;
+    statusline)
+        require_login
+        ensure_policy
+        ensure_sandbox
+        configure_statusline
+        echo "[claude-sbx] statusline installed into '$NAME'." >&2
+        ;;
     *)
         require_login
         ensure_policy
         print_banner
         ensure_sandbox
+        configure_statusline
         # Re-attach by name; the agent is read from the sandbox spec.
         if [ "$#" -gt 0 ]; then
             exec sbx run --name "$NAME" -- "$@"
