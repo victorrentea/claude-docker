@@ -1,149 +1,145 @@
 #!/usr/bin/env bash
-# Host-side launcher for Claude Code inside a Docker Sandbox (`docker sandbox`).
+# Host-side launcher for Claude Code inside a Docker Sandbox, via the standalone
+# `sbx` CLI — Docker Sandboxes (https://docs.docker.com/ai/sandboxes).
 #
 # A lighter sibling of `claude-docker`: instead of a hand-built image plus an
-# iptables firewall, this delegates to Docker's official agent-sandbox feature
-# (`docker sbx` / `docker sandbox`), which manages the microVM, the workspace
-# bind-mount, and a MITM egress proxy for us. Same spirit, far less machinery.
+# iptables firewall, this delegates to Docker Sandboxes, which manages the
+# microVM, the workspace bind-mount, a host-side network policy, and a
+# credential-brokering proxy.
 #
-# AUTH — Docker brokers Anthropic credentials via a HOST-SIDE proxy
-#   Docker Sandbox routes Anthropic traffic through a proxy on the host. The
-#   agent inside sends the sentinel `proxy-managed` (see `apiKeyHelper` in the
-#   template's ~/.claude/settings.json); for the configured hosts —
-#   api.anthropic.com, console.anthropic.com, claude.ai, mcp-proxy.anthropic.com
-#   — the proxy swaps that sentinel for a REAL credential REGISTERED ON THE HOST.
-#   The real secret never enters the sandbox.
+# ── AUTH — Docker brokers Anthropic credentials via a HOST-SIDE proxy ──
+#   The agent inside the sandbox sends the sentinel `proxy-managed`; for the
+#   configured Anthropic hosts the proxy swaps it for a credential REGISTERED
+#   ON THE HOST. The real secret never enters the sandbox. Register yours once:
+#     • Subscription (Pro/Max): run  /login  inside Claude Code (OAuth on host).
+#     • API key:  echo "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
+#   Do NOT set keys manually inside the sandbox (the proxy overrides auth for
+#   the configured hosts, so an unregistered credential yields
+#   "credit balance is too low"). Note: `sbx secret --oauth` is openai-only, so
+#   an Anthropic *subscription* must go through /login, not `sbx secret`.
 #
-#   ⇒ Register a host-side credential once, or every request comes back
-#     "credit balance is too low":
-#       • Subscription (Pro/Max): run  /login  inside Claude Code once — the
-#         OAuth flow runs on the host and the proxy brokers it thereafter.
-#       • API key: install the standalone `sbx` CLI and run
-#         `sbx secret set -g anthropic`  (docs.docker.com/ai/sandboxes).
-#
-#   Do NOT hand-set keys/tokens INSIDE the sandbox (the docs warn against it):
-#   the proxy overrides auth for the configured hosts, so an unregistered
-#   credential still fails. For the same reason keep those hosts on --allow-host
-#   (MITM on) — a --bypass-host would stop the proxy from injecting the secret.
-#   NOTE: this launcher drives the `docker sandbox` plugin (v0.12.x), which has
-#   NO `secret` subcommand; for `sbx secret …` install the standalone CLI:
-#   `brew install docker/tap/sbx`. (`claude-docker` remains a proxy-free
-#   alternative that logs in straight to Anthropic.)
+# ── NETWORK — one GLOBAL policy, machine-wide (sbx policy init <p>) ──
+#     allow-all | balanced | deny-all
+#   `balanced` (the default here) permits AI services + package registries and
+#   blocks the rest — a sane default for Claude. This launcher initializes the
+#   global policy only when it is not set yet; it NEVER clobbers an existing one
+#   (that would affect all your sandboxes). Set CLAUDE_SBX_POLICY=deny-all to
+#   start locked down — the hosts in allowlist.txt are then allowed so Claude
+#   can still reach Anthropic + registries.
 #
 # Usage:
 #   claude-sbx                    # run claude in the current directory
 #   claude-sbx <claude-args...>   # forwarded to claude (e.g. --continue, -p ...)
 #   claude-sbx shell              # open a shell inside the sandbox
-#   claude-sbx net                # (re)apply the egress allowlist proxy
-#   claude-sbx logs               # show sandbox network logs
+#   claude-sbx policy             # show the global network policy
+#   claude-sbx logs               # show this sandbox's allow/block log
 #   claude-sbx stop               # stop the sandbox (state is kept)
-#   claude-sbx rm                 # remove the sandbox and its resources
+#   claude-sbx rm                 # remove the sandbox
 #   claude-sbx ls                 # list sandboxes
 #
 # Env overrides:
-#   CLAUDE_SBX_WORKSPACE   host dir to mount            (default: $PWD)
-#   CLAUDE_SBX_NAME        sandbox name                 (default: claude-<dir>)
-#   CLAUDE_SBX_ALLOWLIST   egress allowlist file        (default: the allowlist.txt
-#                          shared with claude-docker: ~/workspace/claude-docker/allowlist.txt)
-#   CLAUDE_SBX_TEMPLATE    container template image     (passed to -t / --template)
-#   CLAUDE_SBX_NO_PROXY=1  skip the egress allowlist (allow all outbound)
+#   CLAUDE_SBX_WORKSPACE   host dir to mount              (default: $PWD)
+#   CLAUDE_SBX_NAME        sandbox name                   (default: claude-<dir>)
+#   CLAUDE_SBX_POLICY      global net policy if unset     (default: balanced)
+#   CLAUDE_SBX_ALLOWLIST   hosts to allow under deny-all  (default: shared allowlist.txt)
+#   CLAUDE_SBX_TEMPLATE    container template image       (passed to -t)
 set -euo pipefail
 
-command -v docker >/dev/null 2>&1 \
-    || { echo "[claude-sbx] docker not found on PATH" >&2; exit 1; }
-docker sandbox version >/dev/null 2>&1 \
-    || { echo "[claude-sbx] 'docker sandbox' unavailable — update Docker Desktop" >&2; exit 1; }
+command -v sbx >/dev/null 2>&1 \
+    || { echo "[claude-sbx] 'sbx' not found. Install: brew install docker/tap/sbx" >&2; exit 1; }
 
 WORKSPACE="${CLAUDE_SBX_WORKSPACE:-$(pwd -P)}"
-# Shared with claude-docker so both launchers enforce the same egress policy.
+POLICY="${CLAUDE_SBX_POLICY:-balanced}"
 ALLOWLIST_FILE="${CLAUDE_SBX_ALLOWLIST:-$HOME/workspace/claude-docker/allowlist.txt}"
 
-# Deterministic sandbox name from the workspace basename, sanitized to the
-# charset docker sandbox accepts (letters, digits, . _ + -).
+# sbx sandbox names: letters, digits, . + - (no underscore, unlike the old plugin).
 default_name="claude-$(basename "$WORKSPACE")"
-default_name="$(printf '%s' "$default_name" | tr -c 'A-Za-z0-9._+-' '-')"
+default_name="$(printf '%s' "$default_name" | tr -c 'A-Za-z0-9.+-' '-')"
 NAME="${CLAUDE_SBX_NAME:-$default_name}"
 
 TEMPLATE_ARGS=()
 [ -n "${CLAUDE_SBX_TEMPLATE:-}" ] && TEMPLATE_ARGS=( -t "$CLAUDE_SBX_TEMPLATE" )
 
-sandbox_exists() { docker sandbox ls 2>/dev/null | grep -Fq -- "$NAME"; }
-
-# Build the deny-by-default egress proxy from the shared allowlist.
-apply_proxy() {
-    [ "${CLAUDE_SBX_NO_PROXY:-0}" = "1" ] && return 0
-    [ -f "$ALLOWLIST_FILE" ] || { echo "[claude-sbx] no allowlist ($ALLOWLIST_FILE) — leaving egress unrestricted" >&2; return 0; }
-    local args=() d n=0
-    while IFS= read -r d; do
-        [ -n "$d" ] && { args+=( --allow-host "$d" ); n=$((n + 1)); }
-    done < <(grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE")
-    [ "$n" -eq 0 ] && return 0
-    echo "[claude-sbx] applying egress allowlist ($n hosts, default-deny)..." >&2
-    docker sandbox network proxy "$NAME" --policy deny "${args[@]}" >/dev/null
+require_login() {
+    # `sbx ls` exits non-zero when not signed in to Docker.
+    if ! sbx ls >/dev/null 2>&1; then
+        echo "[claude-sbx] not signed in to Docker. Run:  sbx login" >&2
+        exit 1
+    fi
 }
+
+ensure_policy() {
+    # The global network policy must exist before the first sandbox starts.
+    # `sbx policy ls` exits non-zero until it is initialized.
+    if sbx policy ls >/dev/null 2>&1; then
+        return 0   # already initialized — leave the user's choice untouched
+    fi
+    echo "[claude-sbx] initializing GLOBAL network policy: $POLICY" >&2
+    sbx policy init "$POLICY" >/dev/null
+    if [ "$POLICY" = "deny-all" ] && [ -f "$ALLOWLIST_FILE" ]; then
+        local hosts n
+        hosts="$(grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE" | paste -sd, -)"
+        n="$(grep -vcE '^\s*(#|$)' "$ALLOWLIST_FILE")"
+        if [ -n "$hosts" ]; then
+            echo "[claude-sbx] allowing $n hosts from allowlist.txt" >&2
+            sbx policy allow network "$hosts" >/dev/null
+        fi
+    fi
+}
+
+sandbox_exists() { sbx ls 2>/dev/null | grep -Fq -- "$NAME"; }
 
 ensure_sandbox() {
     if ! sandbox_exists; then
         echo "[claude-sbx] creating sandbox '$NAME' for $WORKSPACE..." >&2
-        # --name / --template are flags of `create` itself, so they precede the `claude` subcommand.
-        docker sandbox create --name "$NAME" ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"} claude "$WORKSPACE" >/dev/null
+        sbx create --name "$NAME" ${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"} claude "$WORKSPACE" >/dev/null
     fi
-    apply_proxy
 }
 
 print_banner() {
     local sep='══════════════════════════════════════════════════════════════════════'
-    local n=0
-    if [ "${CLAUDE_SBX_NO_PROXY:-0}" != "1" ] && [ -f "$ALLOWLIST_FILE" ]; then
-        n=$(grep -vcE '^\s*(#|$)' "$ALLOWLIST_FILE")
-    fi
     printf '\n%s\n' "$sep"
-    printf ' claude-sbx · Docker Sandbox (docker sbx)\n'
+    printf ' claude-sbx · Docker Sandboxes (sbx)\n'
     printf '%s\n' "$sep"
     printf ' sandbox        %s\n' "$NAME"
     printf ' workspace      %s  (mounted at same path)\n' "$WORKSPACE"
-    if [ "${CLAUDE_SBX_NO_PROXY:-0}" = "1" ]; then
-        printf ' egress         UNRESTRICTED (CLAUDE_SBX_NO_PROXY=1)\n'
-    elif [ "$n" -gt 0 ]; then
-        printf ' egress ALLOW   %d hosts from %s (default-deny)\n' "$n" "$ALLOWLIST_FILE"
-    else
-        printf ' egress         unrestricted (no allowlist found)\n'
-    fi
+    printf ' net policy     global — see: claude-sbx policy\n'
     printf ' auth           proxy-brokered on host; first time run  /login  in Claude Code\n'
-    printf '                (for your subscription; do NOT set keys inside the sandbox)\n'
+    printf '                (subscription; do NOT set keys inside the sandbox)\n'
     printf '%s\n\n' "$sep"
 }
 
 cmd="${1:-}"
 case "$cmd" in
     shell)
-        ensure_sandbox
-        docker sandbox exec -it "$NAME" bash 2>/dev/null \
-            || docker sandbox exec -it "$NAME" sh
+        require_login
+        sbx exec -it "$NAME" bash 2>/dev/null || sbx exec -it "$NAME" sh
         ;;
-    net|refresh)
-        ensure_sandbox
-        echo "[claude-sbx] egress allowlist applied to '$NAME'." >&2
+    policy)
+        sbx policy ls
         ;;
-    logs)
-        docker sandbox network log
+    logs|log)
+        sbx policy log "$NAME"
         ;;
     stop)
-        docker sandbox stop "$NAME"
+        sbx stop "$NAME"
         ;;
-    rm|remove)
-        docker sandbox rm "$NAME"
+    rm|remove|delete)
+        sbx rm -f "$NAME"
         ;;
     ls|list)
-        docker sandbox ls
+        sbx ls
         ;;
     *)
+        require_login
+        ensure_policy
         print_banner
         ensure_sandbox
+        # Re-attach by name; the agent is read from the sandbox spec.
         if [ "$#" -gt 0 ]; then
-            exec docker sandbox run "$NAME" -- "$@"
+            exec sbx run --name "$NAME" -- "$@"
         else
-            exec docker sandbox run "$NAME"
+            exec sbx run --name "$NAME"
         fi
         ;;
 esac
